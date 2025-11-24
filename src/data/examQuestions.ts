@@ -23,7 +23,8 @@ export const examData = {
           Q1: {
             id: "Q1",
             type: "blank" as const,
-            question: "What is your age?"
+            question: "What is your age?",
+            answers: []
           },
           Q2: {
             id: "Q2",
@@ -36,13 +37,15 @@ export const examData = {
               "freelancer",
               "entrepreneur",
               "other"
-            ]
+            ],
+            answers: []
           },
           Q3: {
             id: "Q3",
             type: "audio" as const,
             question: "Record yourself answering the next audio question:",
-            tts_text: "What day is it today?"
+            tts_text: "What day is it today?",
+            answers: []
           },
           Q4: {
             id: "Q4",
@@ -51,12 +54,14 @@ export const examData = {
             options: [
               "I remember better when I read.",
               "I remember better when I hear."
-            ]
+            ],
+            answers: []
           },
           Q5: {
             id: "Q5",
             type: "blank" as const,
-            question: "Can you remember what the first question was? Write it down."
+            question: "Can you remember what the first question was? Write it down.",
+            answers: []
           }
         }
       },

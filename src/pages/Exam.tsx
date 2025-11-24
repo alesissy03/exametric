@@ -13,8 +13,11 @@ import { Volume2, ChevronRight, ChevronLeft } from 'lucide-react';
 import { useTextToSpeech } from '@/hooks/useTextToSpeech';
 import { useToast } from '@/hooks/use-toast';
 import { database } from '@/lib/firebase';
-import { ref, push, set } from 'firebase/database';
+import { ref, push, set, get } from 'firebase/database';
 import Navigation from '@/components/Navigation';
+import { uploadAudioForTranscription } from '@/lib/speechApi';
+import { uploadAudioBlob } from '@/lib/storage';
+
 
 // Helper to get a random subset of keys
 function getRandomIds<T extends Record<string, any>>(obj: T, count: number): string[] {
@@ -65,11 +68,16 @@ export default function Exam() {
   const { toast } = useToast();
   const { speak, stop, isSpeaking } = useTextToSpeech();
 
+  const EXAM_DURATION_MS = 20 * 60 * 1000; // 20 minutes
+  const PROGRESS_PATH = (uid: string | undefined) => `examProgress/${uid}`;
+  const RESULTS_PATH = (uid: string | undefined) => `examResults/${uid}`;
+
   const [currentSection, setCurrentSection] = useState<SectionId>('section1_accomodation');
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [answers, setAnswers] = useState<Record<string, { text?: string; audioUrl?: string }>>({});
+  const [answers, setAnswers] = useState<Record<string, { text?: string; audioUrl?: string; storagePath?: string }>>({});
   const [textAnswer, setTextAnswer] = useState('');
-  const [startTime] = useState(Date.now());
+  const [startTimestamp, setStartTimestamp] = useState<number | null>(null);
+  const [timeLeftMs, setTimeLeftMs] = useState<number>(EXAM_DURATION_MS);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const sections = Object.keys(examData.exam.sets) as SectionId[];
@@ -89,8 +97,89 @@ export default function Exam() {
   useEffect(() => {
     if (!user) {
       navigate('/login');
+      return;
     }
+
+    // Prevent admin users from taking the exam
+    if (user.role === 'admin') {
+      toast({ title: 'Access denied', description: 'Admins cannot take the exam. Use the admin review page.' });
+      navigate('/admin/review');
+      return;
+    }
+
+    // Check if the user already has a submitted result -> prevent retake
+    (async () => {
+      try {
+        const resultsSnapshot = await get(ref(database, `examResults/${user.id}`));
+        if (resultsSnapshot.exists()) {
+          // User has previous results — prevent retake
+          toast({
+            title: 'Exam already taken',
+            description: 'You have already submitted this exam. You cannot retake it.',
+            variant: 'destructive',
+          });
+          navigate('/results');
+          return;
+        }
+
+        // Try to load progress
+        const progressSnapshot = await get(ref(database, PROGRESS_PATH(user.id)));
+        if (progressSnapshot.exists()) {
+          const data = progressSnapshot.val();
+          if (data.submitted) {
+            toast({ title: 'Exam already submitted', description: 'You have already submitted this exam.' });
+            navigate('/results');
+            return;
+          }
+
+          // Resume in-progress exam
+          if (data.answers) setAnswers(data.answers);
+          if (data.currentSection) setCurrentSection(data.currentSection as SectionId);
+          if (typeof data.currentQuestionIndex === 'number') setCurrentQuestionIndex(data.currentQuestionIndex);
+          if (typeof data.startTimestamp === 'number') {
+            setStartTimestamp(data.startTimestamp);
+            const elapsed = Date.now() - data.startTimestamp;
+            const remaining = Math.max(EXAM_DURATION_MS - elapsed, 0);
+            setTimeLeftMs(remaining);
+            if (remaining <= 0) {
+              // Time's up, auto-submit
+              toast({ title: 'Time is up', description: 'Exam time expired. Submitting your answers.' });
+              handleSubmit();
+            }
+          }
+        } else {
+          // No progress — set start timestamp now and save
+          const ts = Date.now();
+          setStartTimestamp(ts);
+          await set(ref(database, PROGRESS_PATH(user.id)), {
+            startTimestamp: ts,
+            currentSection,
+            currentQuestionIndex,
+            answers: {},
+            submitted: false,
+          });
+        }
+      } catch (err) {
+        console.error('Error loading progress:', err);
+      }
+    })();
   }, [user, navigate]);
+
+  // Timer tick
+  useEffect(() => {
+    if (startTimestamp === null) return;
+    const interval = setInterval(() => {
+      const elapsed = Date.now() - startTimestamp;
+      const remaining = Math.max(EXAM_DURATION_MS - elapsed, 0);
+      setTimeLeftMs(remaining);
+      if (remaining <= 0) {
+        clearInterval(interval);
+        toast({ title: 'Time is up', description: 'Exam time expired. Submitting your answers.' });
+        handleSubmit();
+      }
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [startTimestamp]);
 
   useEffect(() => {
     // Auto-speak audio questions
@@ -99,14 +188,29 @@ export default function Exam() {
     }
     return () => stop();
   }, [currentQuestion, currentSection, currentQuestionIndex]);
-
   useEffect(() => {
     // Load existing answer for current question
     const existingAnswer = answers[questionKey];
     setTextAnswer(existingAnswer?.text || '');
   }, [questionKey, answers]);
 
-  const handleTextAnswerSave = () => {
+  const saveProgress = async (updatedAnswers?: typeof answers, cs?: SectionId, cqIdx?: number, ts?: number) => {
+    if (!user) return;
+    try {
+      const payload = {
+        startTimestamp: ts ?? startTimestamp,
+        currentSection: cs ?? currentSection,
+        currentQuestionIndex: typeof cqIdx === 'number' ? cqIdx : currentQuestionIndex,
+        answers: updatedAnswers ?? answers,
+        submitted: false,
+      } as any;
+      await set(ref(database, PROGRESS_PATH(user.id)), payload);
+    } catch (err) {
+      console.error('Error saving progress:', err);
+    }
+  };
+
+  const handleTextAnswerSave = async() => {
     if (currentQuestion.type === 'multiple') {
       if (textAnswer.startsWith('other:') && textAnswer.replace('other:', '').trim() === '') {
         toast({
@@ -136,10 +240,13 @@ export default function Exam() {
       }
     }
 
-    setAnswers((prev) => ({
-      ...prev,
+    const updated = {
+      ...answers,
       [questionKey]: { text: textAnswer },
-    }));
+    };
+
+    setAnswers(updated);
+    await saveProgress(updated);
 
     toast({
       title: 'Answer saved',
@@ -150,81 +257,47 @@ export default function Exam() {
   };
 
   const handleAudioRecorded = async (blob: Blob) => {
+    if (!user) {
+      toast({ title: 'Not authenticated', description: 'Please sign in to submit audio.', variant: 'destructive' });
+      return;
+    }
+
     try {
-      console.log('Processing audio recording...');
-      
-      // Convert audio blob to base64
-      const reader = new FileReader();
-      reader.readAsDataURL(blob);
-      
-      await new Promise((resolve, reject) => {
-        reader.onloadend = async () => {
-          try {
-            const base64Audio = (reader.result as string).split(',')[1];
+      console.log('Uploading audio to Storage...');
+      const storagePath = `examAnswers/${user.id}/${questionKey}/${Date.now()}.webm`;
+      const { url: audioUrl, path } = await uploadAudioBlob(blob, storagePath);
 
-            // TODO  This is not real API key
-            const GOOGLE_API_KEY = 'AIzaSyD9Eq7tAmxx6o1iFBYb-s-3fLKqIl-8DDU';
-            
-            const response = await fetch(
-              `https://speech.googleapis.com/v1/speech:recognize?key=${GOOGLE_API_KEY}`,
-              {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  config: {
-                    encoding: 'WEBM_OPUS',
-                    sampleRateHertz: 48000,
-                    languageCode: 'en-US',
-                  },
-                  audio: {
-                    content: base64Audio,
-                  },
-                }),
-              }
-            );
+      // Save audio URL to answers immediately to preserve data even if STT fails
+      const partial = {
+        ...answers,
+        [questionKey]: { audioUrl, storagePath: path },
+      };
+      setAnswers(partial);
+      await saveProgress(partial);
 
-            if (!response.ok) {
-              const error = await response.json();
-              console.error('Google Speech-to-Text error:', error);
-              throw new Error('Failed to transcribe audio');
-            }
+      toast({ title: 'Audio uploaded', description: 'Stored audio will be processed for transcription.' });
 
-            const result = await response.json();
-            const text = result.results?.[0]?.alternatives?.[0]?.transcript || '';
-            
-            if (!text) {
-              throw new Error('No transcription received');
-            }
+      // Attempt transcription (best-effort). If it fails, leave transcript empty for manual review.
+      try {
+        const metadata = { questionKey, languageCode: 'en-US', expectedAnswers: currentQuestion.answers };
+        const result = await uploadAudioForTranscription(blob, metadata);
+        const text = result.transcript;
+        if (text) {
+          const withText = { ...partial, [questionKey]: { ...partial[questionKey], text } };
+          setAnswers(withText);
+          await saveProgress(withText);
+          toast({ title: 'Transcription saved', description: 'Speech-to-text processed (may be manual-reviewed).' });
+        }
+      } catch (sttErr) {
+        console.warn('STT failed, audio retained for manual processing', sttErr);
+      }
 
-            console.log('Transcribed text:', text);
-
-            setAnswers((prev) => ({
-              ...prev,
-              [questionKey]: { text },
-            }));
-
-            toast({
-              title: 'Answer saved',
-              description: 'Moving to next question.',
-            });
-
-            handleNext();
-            resolve(null);
-          } catch (error) {
-            reject(error);
-          }
-        };
-        reader.onerror = reject;
-      });
+      if (import.meta.env.VITE_AUTO_NEXT_AFTER_SPEECH === 'true') {
+        handleNext();
+      }
     } catch (error) {
-      console.error('Error transcribing audio:', error);
-      toast({
-        title: 'Transcription failed',
-        description: 'Failed to process audio. Please try again.',
-        variant: 'destructive',
-      });
+      console.error('Error processing speech:', error);
+      toast({ title: 'Audio upload failed', description: error instanceof Error ? error.message : 'Failed to upload audio.', variant: 'destructive' });
     }
   };
 
@@ -301,21 +374,21 @@ export default function Exam() {
   };
 
   const handleSubmit = async () => {
-    if (answeredCount < totalQuestions) {
-      const confirmed = window.confirm(
-        `You have answered ${answeredCount} out of ${totalQuestions} questions. Submit anyway?`
-      );
+    if (!user) return;
+
+    if (Object.keys(answers).length < totalQuestions) {
+      const confirmed = window.confirm(`You have answered ${Object.keys(answers).length} out of ${totalQuestions} questions. Submit anyway?`);
       if (!confirmed) return;
     }
 
     setIsSubmitting(true);
 
     try {
-      const timeSpent = Math.floor((Date.now() - startTime) / 1000);
+      const timeSpent = Math.floor(((startTimestamp ?? Date.now()) - (startTimestamp ?? Date.now())) / 1000);
       const { correctAnswers, analysis } = calculateScore();
-      const score = answeredCount > 0 ? Math.round((correctAnswers / answeredCount) * 100) : 0;
+      const score = Object.keys(answers).length > 0 ? Math.round((correctAnswers / Object.keys(answers).length) * 100) : 0;
 
-      const examData = {
+      const examResult = {
         userId: user?.id,
         email: user?.email,
         answers,
@@ -325,41 +398,25 @@ export default function Exam() {
         timestamp: new Date().toISOString(),
         timeSpent,
         totalQuestions,
-        answeredCount,
+        answeredCount: Object.keys(answers).length,
       };
 
-      console.log('Submitting exam data to Realtime Database:', examData);
-      
-      const resultsRef = ref(database, `examResults/${user?.id}`);
+      const resultsRef = ref(database, `examResults/${user.id}`);
       const newResultRef = push(resultsRef);
-      await set(newResultRef, examData);
-      
-      console.log('Exam submitted successfully with ID:', newResultRef.key);
+      await set(newResultRef, examResult);
 
-      toast({
-        title: 'Exam submitted!',
-        description: `Your score: ${score}%. Results saved successfully.`,
-      });
+      // Remove progress after successful submit
+      await set(ref(database, PROGRESS_PATH(user.id)), { submitted: true });
 
+      toast({ title: 'Exam submitted!', description: `Your score: ${score}%. Results saved successfully.` });
       navigate('/results');
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('Error submitting exam:', error);
-      console.error('Error code:', error?.code);
-      console.error('Error message:', error?.message);
-      
+      const message = error instanceof Error ? error.message : JSON.stringify(error);
       let errorMessage = 'Failed to submit exam. Please try again.';
-      
-      if (error?.code === 'permission-denied') {
-        errorMessage = 'Permission denied. Please check Firebase Security Rules.';
-      } else if (error?.code === 'unavailable') {
-        errorMessage = 'Network error. Please check your internet connection.';
-      }
-      
-      toast({
-        title: 'Submission failed',
-        description: errorMessage,
-        variant: 'destructive',
-      });
+      if (message.includes('permission-denied')) errorMessage = 'Permission denied. Please check Firebase Security Rules.';
+      if (message.includes('unavailable')) errorMessage = 'Network error. Please check your internet connection.';
+      toast({ title: 'Submission failed', description: errorMessage, variant: 'destructive' });
     } finally {
       setIsSubmitting(false);
     }
@@ -385,6 +442,9 @@ export default function Exam() {
                 <span>{Math.round(progress)}%</span>
               </div>
               <Progress value={progress} />
+              <div className="flex justify-between text-sm text-muted-foreground">
+                <span>Time left: {new Date(timeLeftMs).toISOString().substr(11, 8)}</span>
+              </div>
             </div>
           </CardHeader>
 
@@ -429,8 +489,8 @@ export default function Exam() {
 
                 {currentQuestion.type === 'multiple' && currentQuestion.options && (
                   <div className="space-y-4">
-                    <RadioGroup 
-                      value={textAnswer.startsWith('other:') ? 'other' : textAnswer} 
+                    <RadioGroup
+                      value={textAnswer.startsWith('other:') ? 'other' : textAnswer}
                       onValueChange={(value) => {
                         if (value.toLowerCase() === 'other') {
                           setTextAnswer('other:');
@@ -442,39 +502,39 @@ export default function Exam() {
                       <div className="space-y-3">
                         {currentQuestion.options.map((option, index) => (
                           <div key={index}>
-                            <div
-                              className="flex items-center space-x-3 border rounded-lg p-4 hover:bg-blue-50 hover:border-blue-200 transition-all"
-                            >
+                            <div className="flex items-center space-x-3 border rounded-lg p-4 hover:bg-blue-50 hover:border-blue-200 transition-all">
                               <RadioGroupItem value={option} id={`option-${index}`} />
-                              <Label 
-                                htmlFor={`option-${index}`} 
+                              <Label
+                                htmlFor={`option-${index}`}
                                 className="flex-1 cursor-pointer text-base"
                               >
                                 {option}
                               </Label>
                             </div>
-                            
-                            {/* Show text input when "other" is selected */}
-                            {option.toLowerCase() === 'other' && textAnswer.startsWith('other:') && (
-                              <div className="space-y-4">
-                                <Textarea
-                                  value={textAnswer.replace('other:', '')}
-                                  onChange={(e) => setTextAnswer(`other:${e.target.value}`)}
-                                  placeholder="Please specify..."
-                                  className="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary"
-                                />
-                              </div>
-                            )}
+                            {option.toLowerCase() === 'other' &&
+                              textAnswer.startsWith('other:') && (
+                                <div className="space-y-4">
+                                  <Textarea
+                                    value={textAnswer.replace('other:', '')}
+                                    onChange={(e) =>
+                                      setTextAnswer(`other:${e.target.value}`)
+                                    }
+                                    placeholder="Please specify..."
+                                    className="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary"
+                                  />
+                                </div>
+                              )}
                           </div>
                         ))}
                       </div>
                     </RadioGroup>
-                    <Button 
-                      onClick={handleTextAnswerSave} 
-                      className="w-full" 
+                    <Button
+                      onClick={handleTextAnswerSave}
+                      className="w-full"
                       disabled={
-                        !textAnswer || 
-                        (textAnswer.startsWith('other:') && textAnswer.replace('other:', '').trim() === '')
+                        !textAnswer ||
+                        (textAnswer.startsWith('other:') &&
+                          textAnswer.replace('other:', '').trim() === '')
                       }
                     >
                       Save & Continue
