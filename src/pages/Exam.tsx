@@ -1,22 +1,63 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
-import { examData } from '@/data/examQuestions';
+import { examData, Question } from '@/data/examQuestions';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { AudioRecorder } from '@/components/exam/AudioRecorder';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Progress } from '@/components/ui/progress';
 import { Volume2, ChevronRight, ChevronLeft } from 'lucide-react';
 import { useTextToSpeech } from '@/hooks/useTextToSpeech';
 import { useToast } from '@/hooks/use-toast';
 import { database } from '@/lib/firebase';
-import { ref, push, set, get } from 'firebase/database';
+import { ref, push, set } from 'firebase/database';
 import Navigation from '@/components/Navigation';
-import { uploadAudioForTranscription } from '@/lib/speechApi';
-import { uploadAudioBlob } from '@/lib/storage';
 
-type SectionId = 'section1_standard' | 'section1_control' | 'section2_standard' | 'section2_control';
+// Helper to get a random subset of keys
+function getRandomIds<T extends Record<string, any>>(obj: T, count: number): string[] {
+  const keys = Object.keys(obj);
+  // Fisher–Yates shuffle
+  for (let i = keys.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+  }
+  return keys.slice(0, count);
+}
+
+// Pick 5 written IDs based on section2_standard (Q1..Q12)
+const WRITTEN_QUESTION_IDS = getRandomIds(
+  examData.exam.sets.section2_standard.questions,
+  5
+);
+
+// Pick 5 audio IDs based on section3_standard (Q1..Q12)
+const AUDIO_QUESTION_IDS = getRandomIds(
+  examData.exam.sets.section3_standard.questions,
+  5
+);
+
+type SectionId = 'section1_accomodation' | 'section2_standard' | 'section2_control' | 'section3_standard' | 'section3_control';
+
+function getSectionQuestions(sectionId: SectionId): Question[] {
+  const section = examData.exam.sets[sectionId];
+  let questions = Object.values(section.questions);
+
+  // Filter written sections by WRITTEN_QUESTION_IDS
+  if (sectionId === 'section2_standard' || sectionId === 'section2_control') {
+    questions = questions.filter((q) => WRITTEN_QUESTION_IDS.includes(q.id));
+  }
+
+  // Filter audio sections by AUDIO_QUESTION_IDS
+  if (sectionId === 'section3_standard' || sectionId === 'section3_control') {
+    questions = questions.filter((q) => AUDIO_QUESTION_IDS.includes(q.id));
+  }
+
+  // section1_accomodation is unchanged
+  return questions;
+}
 
 export default function Exam() {
   const { user } = useAuth();
@@ -24,26 +65,21 @@ export default function Exam() {
   const { toast } = useToast();
   const { speak, stop, isSpeaking } = useTextToSpeech();
 
-  const EXAM_DURATION_MS = 20 * 60 * 1000; // 20 minutes
-  const PROGRESS_PATH = (uid: string | undefined) => `examProgress/${uid}`;
-  const RESULTS_PATH = (uid: string | undefined) => `examResults/${uid}`;
-
-  const [currentSection, setCurrentSection] = useState<SectionId>('section1_standard');
+  const [currentSection, setCurrentSection] = useState<SectionId>('section1_accomodation');
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
-  const [answers, setAnswers] = useState<Record<string, { text?: string; audioUrl?: string; storagePath?: string }>>({});
+  const [answers, setAnswers] = useState<Record<string, { text?: string; audioUrl?: string }>>({});
   const [textAnswer, setTextAnswer] = useState('');
-  const [startTimestamp, setStartTimestamp] = useState<number | null>(null);
-  const [timeLeftMs, setTimeLeftMs] = useState<number>(EXAM_DURATION_MS);
+  const [startTime] = useState(Date.now());
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const sections = Object.keys(examData.exam.sets) as SectionId[];
   const currentSectionData = examData.exam.sets[currentSection];
-  const questions = Object.values(currentSectionData.questions);
+  const questions = getSectionQuestions(currentSection);
   const currentQuestion = questions[currentQuestionIndex];
   const questionKey = `${currentSection}_${currentQuestion.id}`;
 
   const totalQuestions = sections.reduce(
-    (sum, sectionId) => sum + Object.keys(examData.exam.sets[sectionId].questions).length,
+    (sum, sectionId) => sum + getSectionQuestions(sectionId).length,
     0
   );
 
@@ -53,166 +89,142 @@ export default function Exam() {
   useEffect(() => {
     if (!user) {
       navigate('/login');
-      return;
     }
-
-    // Prevent admin users from taking the exam
-    if (user.role === 'admin') {
-      toast({ title: 'Access denied', description: 'Admins cannot take the exam. Use the admin review page.' });
-      navigate('/admin/review');
-      return;
-    }
-
-    // Check if the user already has a submitted result -> prevent retake
-    (async () => {
-      try {
-        const resultsSnapshot = await get(ref(database, `examResults/${user.id}`));
-        if (resultsSnapshot.exists()) {
-          // User has previous results — prevent retake
-          toast({
-            title: 'Exam already taken',
-            description: 'You have already submitted this exam. You cannot retake it.',
-            variant: 'destructive',
-          });
-          navigate('/results');
-          return;
-        }
-
-        // Try to load progress
-        const progressSnapshot = await get(ref(database, PROGRESS_PATH(user.id)));
-        if (progressSnapshot.exists()) {
-          const data = progressSnapshot.val();
-          if (data.submitted) {
-            toast({ title: 'Exam already submitted', description: 'You have already submitted this exam.' });
-            navigate('/results');
-            return;
-          }
-
-          // Resume in-progress exam
-          if (data.answers) setAnswers(data.answers);
-          if (data.currentSection) setCurrentSection(data.currentSection as SectionId);
-          if (typeof data.currentQuestionIndex === 'number') setCurrentQuestionIndex(data.currentQuestionIndex);
-          if (typeof data.startTimestamp === 'number') {
-            setStartTimestamp(data.startTimestamp);
-            const elapsed = Date.now() - data.startTimestamp;
-            const remaining = Math.max(EXAM_DURATION_MS - elapsed, 0);
-            setTimeLeftMs(remaining);
-            if (remaining <= 0) {
-              // Time's up, auto-submit
-              toast({ title: 'Time is up', description: 'Exam time expired. Submitting your answers.' });
-              handleSubmit();
-            }
-          }
-        } else {
-          // No progress — set start timestamp now and save
-          const ts = Date.now();
-          setStartTimestamp(ts);
-          await set(ref(database, PROGRESS_PATH(user.id)), {
-            startTimestamp: ts,
-            currentSection,
-            currentQuestionIndex,
-            answers: {},
-            submitted: false,
-          });
-        }
-      } catch (err) {
-        console.error('Error loading progress:', err);
-      }
-    })();
   }, [user, navigate]);
 
-  // Timer tick
   useEffect(() => {
-    if (startTimestamp === null) return;
-    const interval = setInterval(() => {
-      const elapsed = Date.now() - startTimestamp;
-      const remaining = Math.max(EXAM_DURATION_MS - elapsed, 0);
-      setTimeLeftMs(remaining);
-      if (remaining <= 0) {
-        clearInterval(interval);
-        toast({ title: 'Time is up', description: 'Exam time expired. Submitting your answers.' });
-        handleSubmit();
+    // Auto-speak audio questions
+    if (currentQuestion.type === 'audio' && currentQuestion.tts_text) {
+      speak(currentQuestion.tts_text);
+    }
+    return () => stop();
+  }, [currentQuestion, currentSection, currentQuestionIndex]);
+
+  useEffect(() => {
+    // Load existing answer for current question
+    const existingAnswer = answers[questionKey];
+    setTextAnswer(existingAnswer?.text || '');
+  }, [questionKey, answers]);
+
+  const handleTextAnswerSave = () => {
+    if (currentQuestion.type === 'multiple') {
+      if (textAnswer.startsWith('other:') && textAnswer.replace('other:', '').trim() === '') {
+        toast({
+          title: 'Answer required',
+          description: 'Please specify your answer for "other".',
+          variant: 'destructive',
+        });
+        return;
       }
-    }, 1000);
-    return () => clearInterval(interval);
-  }, [startTimestamp]);
-
-  const saveProgress = async (updatedAnswers?: typeof answers, cs?: SectionId, cqIdx?: number, ts?: number) => {
-    if (!user) return;
-    try {
-      const payload = {
-        startTimestamp: ts ?? startTimestamp,
-        currentSection: cs ?? currentSection,
-        currentQuestionIndex: typeof cqIdx === 'number' ? cqIdx : currentQuestionIndex,
-        answers: updatedAnswers ?? answers,
-        submitted: false,
-      } as any;
-      await set(ref(database, PROGRESS_PATH(user.id)), payload);
-    } catch (err) {
-      console.error('Error saving progress:', err);
-    }
-  };
-
-  const handleTextAnswerSave = async () => {
-    if (!textAnswer.trim()) {
-      toast({ title: 'Answer required', description: 'Please provide an answer before continuing.', variant: 'destructive' });
-      return;
+      
+      if (!textAnswer) {
+        toast({
+          title: 'Answer required',
+          description: 'Please select an option before continuing.',
+          variant: 'destructive',
+        });
+        return;
+      }
+    } else { 
+      if (!textAnswer.trim()) {
+        toast({
+          title: 'Answer required',
+          description: 'Please provide an answer before continuing.',
+          variant: 'destructive',
+        });
+        return;
+      }
     }
 
-    const updated = {
-      ...answers,
+    setAnswers((prev) => ({
+      ...prev,
       [questionKey]: { text: textAnswer },
-    };
+    }));
 
-    setAnswers(updated);
-    await saveProgress(updated);
+    toast({
+      title: 'Answer saved',
+      description: 'Moving to next question.',
+    });
 
-    toast({ title: 'Answer saved', description: 'Moving to next question.' });
     handleNext();
   };
 
   const handleAudioRecorded = async (blob: Blob) => {
-    if (!user) {
-      toast({ title: 'Not authenticated', description: 'Please sign in to submit audio.', variant: 'destructive' });
-      return;
-    }
-
     try {
-      console.log('Uploading audio to Storage...');
-      const storagePath = `examAnswers/${user.id}/${questionKey}/${Date.now()}.webm`;
-      const { url: audioUrl, path } = await uploadAudioBlob(blob, storagePath);
+      console.log('Processing audio recording...');
+      
+      // Convert audio blob to base64
+      const reader = new FileReader();
+      reader.readAsDataURL(blob);
+      
+      await new Promise((resolve, reject) => {
+        reader.onloadend = async () => {
+          try {
+            const base64Audio = (reader.result as string).split(',')[1];
 
-      // Save audio URL to answers immediately to preserve data even if STT fails
-      const partial = {
-        ...answers,
-        [questionKey]: { audioUrl, storagePath: path },
-      };
-      setAnswers(partial);
-      await saveProgress(partial);
+            // TODO  This is not real API key
+            const GOOGLE_API_KEY = 'AIzaSyD9Eq7tAmxx6o1iFBYb-s-3fLKqIl-8DDU';
+            
+            const response = await fetch(
+              `https://speech.googleapis.com/v1/speech:recognize?key=${GOOGLE_API_KEY}`,
+              {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  config: {
+                    encoding: 'WEBM_OPUS',
+                    sampleRateHertz: 48000,
+                    languageCode: 'en-US',
+                  },
+                  audio: {
+                    content: base64Audio,
+                  },
+                }),
+              }
+            );
 
-      toast({ title: 'Audio uploaded', description: 'Stored audio will be processed for transcription.' });
+            if (!response.ok) {
+              const error = await response.json();
+              console.error('Google Speech-to-Text error:', error);
+              throw new Error('Failed to transcribe audio');
+            }
 
-      // Attempt transcription (best-effort). If it fails, leave transcript empty for manual review.
-      try {
-        const metadata = { questionKey, languageCode: 'en-US', expectedAnswers: currentQuestion.answers };
-        const result = await uploadAudioForTranscription(blob, metadata);
-        const text = result.transcript;
-        if (text) {
-          const withText = { ...partial, [questionKey]: { ...partial[questionKey], text } };
-          setAnswers(withText);
-          await saveProgress(withText);
-          toast({ title: 'Transcription saved', description: 'Speech-to-text processed (may be manual-reviewed).' });
-        }
-      } catch (sttErr) {
-        console.warn('STT failed, audio retained for manual processing', sttErr);
-      }
+            const result = await response.json();
+            const text = result.results?.[0]?.alternatives?.[0]?.transcript || '';
+            
+            if (!text) {
+              throw new Error('No transcription received');
+            }
 
-      if (import.meta.env.VITE_AUTO_NEXT_AFTER_SPEECH === 'true') {
-        handleNext();
-      }
+            console.log('Transcribed text:', text);
+
+            setAnswers((prev) => ({
+              ...prev,
+              [questionKey]: { text },
+            }));
+
+            toast({
+              title: 'Answer saved',
+              description: 'Moving to next question.',
+            });
+
+            handleNext();
+            resolve(null);
+          } catch (error) {
+            reject(error);
+          }
+        };
+        reader.onerror = reject;
+      });
     } catch (error) {
-      console.error('Error processing speech:', error);
-      toast({ title: 'Audio upload failed', description: error instanceof Error ? error.message : 'Failed to upload audio.', variant: 'destructive' });
+      console.error('Error transcribing audio:', error);
+      toast({
+        title: 'Transcription failed',
+        description: 'Failed to process audio. Please try again.',
+        variant: 'destructive',
+      });
     }
   };
 
@@ -289,21 +301,21 @@ export default function Exam() {
   };
 
   const handleSubmit = async () => {
-    if (!user) return;
-
-    if (Object.keys(answers).length < totalQuestions) {
-      const confirmed = window.confirm(`You have answered ${Object.keys(answers).length} out of ${totalQuestions} questions. Submit anyway?`);
+    if (answeredCount < totalQuestions) {
+      const confirmed = window.confirm(
+        `You have answered ${answeredCount} out of ${totalQuestions} questions. Submit anyway?`
+      );
       if (!confirmed) return;
     }
 
     setIsSubmitting(true);
 
     try {
-      const timeSpent = Math.floor(((startTimestamp ?? Date.now()) - (startTimestamp ?? Date.now())) / 1000);
+      const timeSpent = Math.floor((Date.now() - startTime) / 1000);
       const { correctAnswers, analysis } = calculateScore();
-      const score = Object.keys(answers).length > 0 ? Math.round((correctAnswers / Object.keys(answers).length) * 100) : 0;
+      const score = answeredCount > 0 ? Math.round((correctAnswers / answeredCount) * 100) : 0;
 
-      const examResult = {
+      const examData = {
         userId: user?.id,
         email: user?.email,
         answers,
@@ -313,25 +325,41 @@ export default function Exam() {
         timestamp: new Date().toISOString(),
         timeSpent,
         totalQuestions,
-        answeredCount: Object.keys(answers).length,
+        answeredCount,
       };
 
-      const resultsRef = ref(database, `examResults/${user.id}`);
+      console.log('Submitting exam data to Realtime Database:', examData);
+      
+      const resultsRef = ref(database, `examResults/${user?.id}`);
       const newResultRef = push(resultsRef);
-      await set(newResultRef, examResult);
+      await set(newResultRef, examData);
+      
+      console.log('Exam submitted successfully with ID:', newResultRef.key);
 
-      // Remove progress after successful submit
-      await set(ref(database, PROGRESS_PATH(user.id)), { submitted: true });
+      toast({
+        title: 'Exam submitted!',
+        description: `Your score: ${score}%. Results saved successfully.`,
+      });
 
-      toast({ title: 'Exam submitted!', description: `Your score: ${score}%. Results saved successfully.` });
       navigate('/results');
-    } catch (error: unknown) {
+    } catch (error: any) {
       console.error('Error submitting exam:', error);
-      const message = error instanceof Error ? error.message : JSON.stringify(error);
+      console.error('Error code:', error?.code);
+      console.error('Error message:', error?.message);
+      
       let errorMessage = 'Failed to submit exam. Please try again.';
-      if (message.includes('permission-denied')) errorMessage = 'Permission denied. Please check Firebase Security Rules.';
-      if (message.includes('unavailable')) errorMessage = 'Network error. Please check your internet connection.';
-      toast({ title: 'Submission failed', description: errorMessage, variant: 'destructive' });
+      
+      if (error?.code === 'permission-denied') {
+        errorMessage = 'Permission denied. Please check Firebase Security Rules.';
+      } else if (error?.code === 'unavailable') {
+        errorMessage = 'Network error. Please check your internet connection.';
+      }
+      
+      toast({
+        title: 'Submission failed',
+        description: errorMessage,
+        variant: 'destructive',
+      });
     } finally {
       setIsSubmitting(false);
     }
@@ -357,9 +385,6 @@ export default function Exam() {
                 <span>{Math.round(progress)}%</span>
               </div>
               <Progress value={progress} />
-              <div className="flex justify-between text-sm text-muted-foreground">
-                <span>Time left: {new Date(timeLeftMs).toISOString().substr(11, 8)}</span>
-              </div>
             </div>
           </CardHeader>
 
@@ -397,6 +422,61 @@ export default function Exam() {
                       className="resize-none"
                     />
                     <Button onClick={handleTextAnswerSave} className="w-full">
+                      Save & Continue
+                    </Button>
+                  </div>
+                )}
+
+                {currentQuestion.type === 'multiple' && currentQuestion.options && (
+                  <div className="space-y-4">
+                    <RadioGroup 
+                      value={textAnswer.startsWith('other:') ? 'other' : textAnswer} 
+                      onValueChange={(value) => {
+                        if (value.toLowerCase() === 'other') {
+                          setTextAnswer('other:');
+                        } else {
+                          setTextAnswer(value);
+                        }
+                      }}
+                    >
+                      <div className="space-y-3">
+                        {currentQuestion.options.map((option, index) => (
+                          <div key={index}>
+                            <div
+                              className="flex items-center space-x-3 border rounded-lg p-4 hover:bg-blue-50 hover:border-blue-200 transition-all"
+                            >
+                              <RadioGroupItem value={option} id={`option-${index}`} />
+                              <Label 
+                                htmlFor={`option-${index}`} 
+                                className="flex-1 cursor-pointer text-base"
+                              >
+                                {option}
+                              </Label>
+                            </div>
+                            
+                            {/* Show text input when "other" is selected */}
+                            {option.toLowerCase() === 'other' && textAnswer.startsWith('other:') && (
+                              <div className="space-y-4">
+                                <Textarea
+                                  value={textAnswer.replace('other:', '')}
+                                  onChange={(e) => setTextAnswer(`other:${e.target.value}`)}
+                                  placeholder="Please specify..."
+                                  className="w-full px-3 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary"
+                                />
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </RadioGroup>
+                    <Button 
+                      onClick={handleTextAnswerSave} 
+                      className="w-full" 
+                      disabled={
+                        !textAnswer || 
+                        (textAnswer.startsWith('other:') && textAnswer.replace('other:', '').trim() === '')
+                      }
+                    >
                       Save & Continue
                     </Button>
                   </div>
